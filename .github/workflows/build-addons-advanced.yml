@@ -1,0 +1,211 @@
+name: Build and Upload Addon Images
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '*/**'
+      - '!README.md'
+      - '!.github/**'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      addon:
+        description: 'Addon to build (leave empty for all)'
+        required: false
+        default: ''
+      version:
+        description: 'Version to build (leave empty for latest)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      matrix:
+        addon: ${{ fromJSON(format('[{0}]', github.event.inputs.addon || '["portainer"]')) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.addon }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ github.event.inputs.version }},enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.addon }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Update addon config with new image
+        if: github.event_name != 'pull_request' && github.event.inputs.version
+        run: |
+          cd ${{ matrix.addon }}
+          # Update the image field in config.json with the new version
+          jq --arg version "${{ github.event.inputs.version }}" \
+             --arg image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.addon }}:${{ github.event.inputs.version }}" \
+             '.version = $version | .image = $image' config.json > config.json.tmp
+          mv config.json.tmp config.json
+          
+          # Update Dockerfile if it references a specific version
+          if grep -q "FROM.*:.*" Dockerfile; then
+            sed -i "s/FROM.*:.*/FROM portainer\/portainer-ee:${{ github.event.inputs.version }}-alpine/" Dockerfile
+          fi
+
+      - name: Commit and push changes
+        if: github.event_name != 'pull_request' && github.event.inputs.version
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add ${{ matrix.addon }}/config.json ${{ matrix.addon }}/Dockerfile
+          git commit -m "Update ${{ matrix.addon }} to version ${{ github.event.inputs.version }}"
+          git push
+
+  build-all:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    if: github.event.inputs.addon == ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find all addons
+        id: find-addons
+        run: |
+          ADDONS=$(find . -maxdepth 1 -type d -name "*" | grep -v "^\.$" | grep -v "^\.git$" | sed 's|^\./||' | jq -R -s -c 'split("\n")[:-1]')
+          echo "addons=$ADDONS" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push all addons
+        run: |
+          for addon in $(find . -maxdepth 1 -type d -name "*" | grep -v "^\.$" | grep -v "^\.git$" | sed 's|^\./||'); do
+            echo "Building $addon..."
+            
+            # Extract version from config.json
+            VERSION=$(jq -r '.version' "$addon/config.json")
+            echo "Version: $VERSION"
+            
+            # Build and push
+            docker buildx build \
+              --platform linux/amd64,linux/arm64,linux/arm/v7 \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/$addon:$VERSION \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/$addon:latest \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --push \
+              ./$addon
+          done
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [build, build-all]
+    if: always()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test addon configurations
+        run: |
+          for addon in $(find . -maxdepth 1 -type d -name "*" | grep -v "^\.$" | grep -v "^\.git$" | sed 's|^\./||'); do
+            echo "Testing $addon configuration..."
+            
+            # Check if config.json exists and is valid JSON
+            if [ -f "$addon/config.json" ]; then
+              if jq empty "$addon/config.json" 2>/dev/null; then
+                echo "✓ $addon/config.json is valid JSON"
+              else
+                echo "✗ $addon/config.json is invalid JSON"
+                exit 1
+              fi
+            else
+              echo "✗ $addon/config.json not found"
+              exit 1
+            fi
+            
+            # Check if Dockerfile exists
+            if [ -f "$addon/Dockerfile" ]; then
+              echo "✓ $addon/Dockerfile exists"
+            else
+              echo "✗ $addon/Dockerfile not found"
+              exit 1
+            fi
+            
+            # Validate required fields in config.json
+            REQUIRED_FIELDS=("name" "version" "slug" "arch" "image")
+            for field in "${REQUIRED_FIELDS[@]}"; do
+              if jq -e ".$field" "$addon/config.json" >/dev/null 2>&1; then
+                echo "✓ $field field exists"
+              else
+                echo "✗ Required field '$field' missing from $addon/config.json"
+                exit 1
+              fi
+            done
+          done
+          
+          echo "All addon configurations are valid!"
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build, build-all, test]
+    if: always()
+    
+    steps:
+      - name: Notify build status
+        run: |
+          if [ "${{ needs.test.result }}" == "success" ]; then
+            echo "✅ All addons built and tested successfully!"
+          else
+            echo "❌ Build or test failed. Check the logs above."
+          fi
