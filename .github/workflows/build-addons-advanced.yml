@@ -11,10 +11,6 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
-      addon:
-        description: 'Addon to build (leave empty for all)'
-        required: false
-        default: ''
       version:
         description: 'Version to build (leave empty for latest)'
         required: false
@@ -25,87 +21,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-
-    strategy:
-      matrix:
-        addon: ${{ fromJSON(format('[{0}]', github.event.inputs.addon || '["portainer"]')) }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.addon }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ github.event.inputs.version }},enable={{is_default_branch}}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./${{ matrix.addon }}
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-
-      - name: Update addon config with new image
-        if: github.event_name != 'pull_request' && github.event.inputs.version
-        run: |
-          cd ${{ matrix.addon }}
-          # Update the image field in config.json with the new version
-          jq --arg version "${{ github.event.inputs.version }}" \
-             --arg image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.addon }}:${{ github.event.inputs.version }}" \
-             '.version = $version | .image = $image' config.json > config.json.tmp
-          mv config.json.tmp config.json
-          
-          # Update Dockerfile if it references a specific version
-          if grep -q "FROM.*:.*" Dockerfile; then
-            sed -i "s/FROM.*:.*/FROM portainer\/portainer-ee:${{ github.event.inputs.version }}-alpine/" Dockerfile
-          fi
-
-      - name: Commit and push changes
-        if: github.event_name != 'pull_request' && github.event.inputs.version
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add ${{ matrix.addon }}/config.json ${{ matrix.addon }}/Dockerfile
-          git commit -m "Update ${{ matrix.addon }} to version ${{ github.event.inputs.version }}"
-          git push
-
   build-all:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       id-token: write
-    if: github.event.inputs.addon == ''
 
     steps:
       - name: Checkout repository
@@ -173,9 +94,18 @@ jobs:
               ./$addon
           done
 
+      - name: Commit and push changes
+        if: github.event.inputs.version != ''
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "Update all addons to version ${{ github.event.inputs.version }}"
+          git push
+
   test:
     runs-on: ubuntu-latest
-    needs: [build, build-all]
+    needs: [build-all]
     if: always()
 
     steps:
@@ -231,7 +161,7 @@ jobs:
 
   notify:
     runs-on: ubuntu-latest
-    needs: [build, build-all, test]
+    needs: [build-all, test]
     if: always()
     
     steps:
