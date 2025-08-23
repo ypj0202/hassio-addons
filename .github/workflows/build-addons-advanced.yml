@@ -79,9 +79,15 @@ jobs:
             
             echo "Building $addon..."
             
-            # Extract version from config.json
-            VERSION=$(jq -r '.version' "$addon/config.json")
-            echo "Version: $VERSION"
+            # Extract upstream version from updater.json if it exists, otherwise use config.json version
+            if [ -f "$addon/updater.json" ]; then
+              UPSTREAM_VERSION=$(jq -r '.upstream_version' "$addon/updater.json")
+              echo "Upstream version from updater.json: $UPSTREAM_VERSION"
+              VERSION=$UPSTREAM_VERSION
+            else
+              VERSION=$(jq -r '.version' "$addon/config.json")
+              echo "Version from config.json: $VERSION"
+            fi
             
             # Build and push
             docker buildx build \
@@ -92,6 +98,37 @@ jobs:
               --cache-to type=gha,mode=max \
               --push \
               ./$addon
+          done
+
+      - name: Update addon configs with new version (if specified)
+        if: github.event.inputs.version != ''
+        run: |
+          for addon in $(find . -maxdepth 1 -type d -name "*" | grep -v "^\.$" | grep -v "^\.git$" | grep -v "^\.github$" | sed 's|^\./||'); do
+            if [ ! -f "$addon/config.json" ] || [ ! -f "$addon/Dockerfile" ]; then
+              continue
+            fi
+            
+            echo "Updating $addon to version ${{ github.event.inputs.version }}..."
+            
+            # Update the image field in config.json with the new version
+            jq --arg version "${{ github.event.inputs.version }}" \
+               --arg image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/$addon:${{ github.event.inputs.version }}" \
+               '.version = $version | .image = $image' "$addon/config.json" > "$addon/config.json.tmp"
+            mv "$addon/config.json.tmp" "$addon/config.json"
+            
+            # Update updater.json if it exists
+            if [ -f "$addon/updater.json" ]; then
+              jq --arg version "${{ github.event.inputs.version }}" \
+                 '.upstream_version = $version' "$addon/updater.json" > "$addon/updater.json.tmp"
+              mv "$addon/updater.json.tmp" "$addon/updater.json"
+              echo "Updated $addon/updater.json upstream_version to ${{ github.event.inputs.version }}"
+            fi
+            
+            # Update Dockerfile if it references a specific version
+            if grep -q "FROM.*:.*" "$addon/Dockerfile"; then
+              sed -i "s/FROM.*:.*/FROM portainer\/portainer-ee:${{ github.event.inputs.version }}-alpine/" "$addon/Dockerfile"
+              echo "Updated $addon/Dockerfile to use version ${{ github.event.inputs.version }}"
+            fi
           done
 
       - name: Commit and push changes
@@ -118,7 +155,6 @@ jobs:
           for addon in $(find . -maxdepth 1 -type d -name "*" | grep -v "^\.$" | grep -v "^\.git$" | grep -v "^\.github$" | sed 's|^\./||'); do
             # Check if this is a valid addon directory
             if [ ! -f "$addon/config.json" ] || [ ! -f "$addon/Dockerfile" ]; then
-              echo "Skipping $addon - missing required files"
               continue
             fi
             
