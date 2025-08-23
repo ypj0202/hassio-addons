@@ -1,7 +1,7 @@
 # Setup base
 ARG BUILD_UPSTREAM="2.33.0"
 
-FROM portainer/portainer-ee:${BUILD_UPSTREAM}-alpine
+FROM portainer/portainer-ee:${BUILD_UPSTREAM}
 
 # Set S6 wait time
 ENV S6_CMD_WAIT_FOR_SERVICES=1 \
